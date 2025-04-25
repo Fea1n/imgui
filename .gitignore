@@ -5,6 +5,8 @@
 bin/
 bin-int/
 
+ImGui.vcxproj
+
 ## Dear ImGui artifacts
 imgui.ini
 imgui*.ini
