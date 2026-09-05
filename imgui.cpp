@@ -1331,6 +1331,7 @@ ImGuiStyle::ImGuiStyle()
     DisplayWindowPadding        = ImVec2(19,19);    // Window position are clamped to be visible within the display area or monitors by at least this amount. Only applies to regular windows.
     DisplaySafeAreaPadding      = ImVec2(3,3);      // If you cannot see the edge of your screen (e.g. on a TV) increase the safe area padding. Covers popups/tooltips as well regular windows.
     DockingSeparatorSize        = 2.0f;             // Thickness of resizing border between docked windows
+    DockNodePadding             = ImVec2(4, 4);      // Padding inside docking nodes, applied to docked windows (inset) so panels get gaps/rounded corners.
     MouseCursorScale            = 1.0f;             // Scale software rendered mouse cursor (when io.MouseDrawCursor is enabled). May be removed later.
     AntiAliasedLines            = true;             // Enable anti-aliased lines/borders. Disable if you are really tight on CPU/GPU.
     AntiAliasedLinesUseTex      = true;             // Enable anti-aliased lines/borders using textures where possible. Require backend to render with bilinear filtering (NOT point/nearest filtering).
@@ -1376,6 +1377,7 @@ void ImGuiStyle::ScaleAllSizes(float scale_factor)
     TabBarOverlineSize = ImTrunc(TabBarOverlineSize * scale_factor);
     SeparatorTextPadding = ImTrunc(SeparatorTextPadding * scale_factor);
     DockingSeparatorSize = ImTrunc(DockingSeparatorSize * scale_factor);
+    DockNodePadding = ImTrunc(DockNodePadding * scale_factor);
     DisplayWindowPadding = ImTrunc(DisplayWindowPadding * scale_factor);
     DisplaySafeAreaPadding = ImTrunc(DisplaySafeAreaPadding * scale_factor);
     MouseCursorScale = ImTrunc(MouseCursorScale * scale_factor);
@@ -3383,6 +3385,7 @@ static const ImGuiDataVarInfo GStyleVarInfo[] =
     { ImGuiDataType_Float, 2, (ImU32)offsetof(ImGuiStyle, SeparatorTextAlign) },        // ImGuiStyleVar_SeparatorTextAlign
     { ImGuiDataType_Float, 2, (ImU32)offsetof(ImGuiStyle, SeparatorTextPadding) },      // ImGuiStyleVar_SeparatorTextPadding
     { ImGuiDataType_Float, 1, (ImU32)offsetof(ImGuiStyle, DockingSeparatorSize) },      // ImGuiStyleVar_DockingSeparatorSize
+    { ImGuiDataType_Float, 2, (ImU32)offsetof(ImGuiStyle, DockNodePadding) },           // ImGuiStyleVar_DockNodePadding
 };
 
 const ImGuiDataVarInfo* ImGui::GetStyleVarInfo(ImGuiStyleVar idx)
@@ -6773,7 +6776,6 @@ void ImGui::RenderWindowDecorations(ImGuiWindow* window, const ImRect& title_bar
         ImGuiDockNode* node = window->DockNode;
         if (window->DockIsActive && node->IsHiddenTabBar() && !node->IsNoTabBar())
         {
-            float unhide_sz_draw = ImTrunc(g.FontSize * 0.70f);
             float unhide_sz_hit = ImTrunc(g.FontSize * 0.55f);
             ImVec2 p = node->Pos;
             ImRect r(p, p + ImVec2(unhide_sz_hit, unhide_sz_hit));
@@ -6787,7 +6789,17 @@ void ImGui::RenderWindowDecorations(ImGuiWindow* window, const ImRect& title_bar
 
             // FIXME-DOCK: Ideally we'd use ImGuiCol_TitleBgActive/ImGuiCol_TitleBg here, but neither is guaranteed to be visible enough at this sort of size..
             ImU32 col = GetColorU32(((held && hovered) || (node->IsFocused && !hovered)) ? ImGuiCol_ButtonActive : hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
-            window->DrawList->AddTriangleFilled(p, p + ImVec2(unhide_sz_draw, 0.0f), p + ImVec2(0.0f, unhide_sz_draw), col);
+            // [Venti] 隐藏 tab bar 的展开标识：由三角样式改为直接依附在窗口左上圆角上的 1/4 圆弧：
+            // 圆心取圆角真实圆心 Pos + (rounding, rounding)、半径取窗口圆角 window_rounding，
+            // 弧线与窗口左上圆角完全重合（顺圆角延伸，不遮挡圆角效果）；
+            // 圆角为 0 时以最小可见半径在角点处补一段圆弧作为标识。
+            const bool has_rounding = (window_rounding > 1.0f);
+            const float arc_radius = has_rounding ? window_rounding : ImMax(g.FontSize * 0.35f, 4.0f);
+            const ImVec2 arc_center = has_rounding
+                ? node->Pos + ImVec2(arc_radius, arc_radius)
+                : node->Pos;
+            window->DrawList->PathArcTo(arc_center, arc_radius, IM_PI, IM_PI * 1.5f, 0);
+            window->DrawList->PathStroke(col, 0, 2.0f);
         }
 
         // Scrollbars
@@ -7485,8 +7497,10 @@ bool ImGui::Begin(const char* name, bool* p_open, ImGuiWindowFlags flags)
 
         // Lock window rounding for the frame (so that altering them doesn't cause inconsistencies)
         // Large values tend to lead to variety of artifacts and are not recommended.
+        // 启用 DockNodePadding（停靠节点内边距）时，停靠窗口需保留圆角，以呈现类 Blender 的圆角+
+        // 缝隙观感；否则保持 0（flush 停靠时圆角无意义且易产生伪影）。
         if (window->ViewportOwned || window->DockIsActive)
-            window->WindowRounding = 0.0f;
+            window->WindowRounding = (style.DockNodePadding.x > 0.0f || style.DockNodePadding.y > 0.0f) ? style.WindowRounding : 0.0f;
         else
             window->WindowRounding = (flags & ImGuiWindowFlags_ChildWindow) ? style.ChildRounding : ((flags & ImGuiWindowFlags_Popup) && !(flags & ImGuiWindowFlags_Modal)) ? style.PopupRounding : style.WindowRounding;
 
@@ -17601,9 +17615,12 @@ static void ImGui::DockNodeUpdate(ImGuiDockNode* node)
     if (node->IsRootNode() && host_window)
     {
         DockNodeTreeUpdatePosSize(node, host_window->Pos, host_window->Size);
-        PushStyleColor(ImGuiCol_Separator, g.Style.Colors[ImGuiCol_Border]);
+        // [Venti] docking 子窗口间的 resize 分隔条配色：
+        //   常态 = rgba(209,212,217) 灰色；拖拽调整窗口时激活 = 蓝色（ResizeGripActive 蓝反馈），
+        //   hover 也置蓝作为可拖拽提示。
+        PushStyleColor(ImGuiCol_Separator, ImVec4(209.0f / 255.0f, 212.0f / 255.0f, 217.0f / 255.0f, 1.0f));
         PushStyleColor(ImGuiCol_SeparatorActive, g.Style.Colors[ImGuiCol_ResizeGripActive]);
-        PushStyleColor(ImGuiCol_SeparatorHovered, g.Style.Colors[ImGuiCol_ResizeGripHovered]);
+        PushStyleColor(ImGuiCol_SeparatorHovered, g.Style.Colors[ImGuiCol_ResizeGripActive]);
         DockNodeTreeUpdateSplitter(node);
         PopStyleColor(3);
     }
@@ -19603,8 +19620,14 @@ void ImGui::BeginDocked(ImGuiWindow* window, bool* p_open)
     }
 
     // Position/Size window
-    SetNextWindowPos(node->Pos);
-    SetNextWindowSize(node->Size);
+    // 应用 DockNodePadding：将停靠窗口向内缩进，使面板之间/与 dockspace 边缘留出缝隙，
+    // 配合 WindowRounding 形成类 Blender 的圆角停靠面板（缝隙透出停靠节点背景）。
+    const ImVec2 dock_padding = g.Style.DockNodePadding;
+    ImVec2 dock_size = node->Size - dock_padding * 2.0f;
+    dock_size.x = ImMax(dock_size.x, 1.0f);
+    dock_size.y = ImMax(dock_size.y, 1.0f);
+    SetNextWindowPos(node->Pos + dock_padding);
+    SetNextWindowSize(dock_size);
     g.NextWindowData.PosUndock = false; // Cancel implicit undocking of SetNextWindowPos()
     window->DockIsActive = true;
     window->DockNodeIsVisible = true;
